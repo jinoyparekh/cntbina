@@ -1,7 +1,6 @@
 # GCP ↔ GitHub OIDC Bootstrap
 
-Keyless auth between GitHub Actions and GCP using Workload Identity Federation.
-No long-lived JSON keys. Terraform state lives in GCS.
+Keyless auth between GitHub Actions and GCP via Workload Identity Federation. No JSON keys. Terraform state in GCS.
 
 ---
 
@@ -11,18 +10,17 @@ No long-lived JSON keys. Terraform state lives in GCS.
 |---|---|
 | Workload Identity Pool | `github-actions-pool` |
 | OIDC Provider | `github-actions-provider` |
-| Terraform Service Account | `terraform-deployer@<project>.iam.gserviceaccount.com` |
+| Service Account | `terraform-deployer@<project>.iam.gserviceaccount.com` |
 | GCS State Bucket | `<project-id>-tfstate` |
 
-**SA roles granted:** `compute.networkAdmin`, `compute.securityAdmin`, `container.admin`, `iam.roleAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `resourcemanager.projectIamAdmin`, `storage.admin`, `serviceusage.serviceUsageAdmin`
+SA roles: `compute.networkAdmin`, `compute.securityAdmin`, `container.admin`, `iam.roleAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `resourcemanager.projectIamAdmin`, `storage.admin`, `serviceusage.serviceUsageAdmin`
 
 ---
 
 ## Prerequisites
 
-- `gcloud` CLI installed and authenticated (`gcloud auth login`)
-- Your account has **Owner** or at minimum `roles/iam.workloadIdentityPoolAdmin` + `roles/iam.serviceAccountAdmin` + `roles/resourcemanager.projectIamAdmin`
-- `gsutil` available (comes with gcloud SDK)
+- `gcloud` CLI authenticated (`gcloud auth login`)
+- Your account has Owner or `iam.workloadIdentityPoolAdmin` + `iam.serviceAccountAdmin` + `resourcemanager.projectIamAdmin`
 
 ---
 
@@ -31,142 +29,70 @@ No long-lived JSON keys. Terraform state lives in GCS.
 ```bash
 export PROJECT_ID="your-gcp-project-id"
 export GITHUB_ORG="your-github-org"
-
-# Optional: restrict to a single repo instead of the whole org
-# export GITHUB_REPO="infra-repo"
-
-export REGION="us-central1"   # region for TF state bucket
+# export GITHUB_REPO="infra-repo"   # optional: restrict to one repo instead of whole org
+# export REGION="us-central1"       # default: us-central1
 
 chmod +x scripts/setup-gcp-oidc.sh
 ./scripts/setup-gcp-oidc.sh
 ```
 
-The script is **idempotent** — safe to re-run if it fails partway through.
-
-At the end it prints three values you need for GitHub:
-
-```
-GCP_WORKLOAD_IDENTITY_PROVIDER   projects/<number>/locations/global/workloadIdentityPools/...
-GCP_SERVICE_ACCOUNT              terraform-deployer@<project>.iam.gserviceaccount.com
-TF_STATE_BUCKET                  <project-id>-tfstate
-```
+Idempotent — safe to re-run. At the end it prints the three values for Step 2.
 
 ---
 
-## Step 2 — GitHub: add secrets
+## Step 2 — GitHub: add Actions variables
 
-Go to your GitHub org or repo → **Settings → Secrets and variables → Actions**.
+Go to **Settings → Secrets and variables → Actions → Variables** (not Secrets — these values are not sensitive).
 
-Add these three **secrets** (or org-level secrets shared to the repo):
-
-| Secret name | Value (from script output) |
+| Variable name | Value (from script output) |
 |---|---|
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/123.../providers/github-actions-provider` |
 | `GCP_SERVICE_ACCOUNT` | `terraform-deployer@your-project.iam.gserviceaccount.com` |
 | `TF_STATE_BUCKET` | `your-project-id-tfstate` |
 
-> **Org secrets** → Settings (org level) → Secrets → Actions → New organization secret → grant access to the relevant repo(s).
->
-> **Repo secrets** → Settings (repo level) → Secrets and variables → Actions → New repository secret.
+> Org-level: **Org Settings → Secrets and variables → Actions → Variables**, then grant access to the repo.
 
 ---
 
 ## Step 3 — Terraform backend
 
-In your Terraform root module add:
-
 ```hcl
 terraform {
   backend "gcs" {
-    bucket = "your-project-id-tfstate"   # or use -backend-config in CI
+    bucket = "your-project-id-tfstate"
     prefix = "terraform/state"
   }
 }
 ```
 
-Or pass it dynamically in the workflow:
-
-```bash
-terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
-```
+Or let the workflow pass it dynamically via `-backend-config` (already done in `.github/workflows/terraform.yml`).
 
 ---
 
-## Step 4 — GitHub Actions workflow
+## Step 4 — Push and trigger
 
-Create `.github/workflows/terraform.yml`:
+The workflow at `.github/workflows/terraform.yml` runs on every push/PR to `main`:
 
-```yaml
-name: Terraform
+- **PRs**: fmt check → validate → plan
+- **Push to main**: fmt check → validate → plan → apply
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
-  id-token: write   # REQUIRED for OIDC
-
-jobs:
-  terraform:
-    name: Plan & Apply
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: auth
-        name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.9"
-
-      - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
-        working-directory: terraform/
-
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
-        working-directory: terraform/
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
-        working-directory: terraform/
-```
-
-> Set `working-directory` to wherever your `.tf` files live.
+Set `TF_DIR` in the workflow `env:` block if your `.tf` files are not in `terraform/`.
 
 ---
 
 ## Verification
 
-After the first successful workflow run, confirm it worked:
-
 ```bash
-# Check the WIF pool and provider exist
-gcloud iam workload-identity-pools list --location=global --project=$PROJECT_ID
+# Pool and provider
 gcloud iam workload-identity-pools providers list \
   --workload-identity-pool=github-actions-pool \
   --location=global --project=$PROJECT_ID
 
-# Check SA exists and has correct bindings
-gcloud iam service-accounts describe terraform-deployer@${PROJECT_ID}.iam.gserviceaccount.com
-
-# Check state bucket
+# State bucket
 gsutil ls -L gs://${PROJECT_ID}-tfstate
 ```
 
-In GitHub Actions, a successful auth step looks like:
-
+A successful auth step in Actions shows:
 ```
 Successfully created a credentials file for 'terraform-deployer@...'
 ```
@@ -177,17 +103,8 @@ Successfully created a credentials file for 'terraform-deployer@...'
 
 | Symptom | Fix |
 |---|---|
-| `roles/iam.workloadIdentityUser` denied | Re-run script; check `GITHUB_ORG` / `GITHUB_REPO` matches exactly |
-| `iam.googleapis.com` not enabled | Script enables it; wait 30–60s after first run |
-| Terraform state permission denied | SA needs `roles/storage.objectAdmin` on the bucket — re-run script |
-| `id-token: write` missing | Add `permissions: id-token: write` to the job or top of workflow |
-| Provider `attribute-condition` fails | Ensure `GITHUB_ORG` in script matches the org slug in the GitHub URL exactly |
-
----
-
-## Security notes
-
-- The attribute condition locks the OIDC token to your org (or specific repo if `GITHUB_REPO` is set). Tokens from other orgs/repos are rejected by GCP even if the JWT is valid.
-- No JSON key is ever created or stored. Credentials are ephemeral per-job tokens.
-- The state bucket has uniform bucket-level access and public access prevention enabled.
-- Versioning on the state bucket allows rollback if state is corrupted.
+| `workloadIdentityUser` denied | Re-run script; verify `GITHUB_ORG`/`GITHUB_REPO` match exactly |
+| Terraform state permission denied | SA needs `storage.admin` at project level — re-run script |
+| `id-token: write` missing | Already set in the workflow `permissions` block |
+| Provider attribute-condition fails | `GITHUB_ORG` must match the GitHub org slug exactly (case-sensitive) |
+| Sandbox bucket IAM warning | Expected — project-level `storage.admin` covers it |
