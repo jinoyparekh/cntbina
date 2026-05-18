@@ -173,11 +173,16 @@ else
 fi
 
 # Grant SA access to the state bucket
-gcloud storage buckets add-iam-policy-binding "gs://${TF_BUCKET}" \
+if gcloud storage buckets add-iam-policy-binding "gs://${TF_BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
-  --quiet
-success "SA granted objectAdmin on state bucket."
+  --quiet; then
+  success "SA granted objectAdmin on state bucket."
+else
+  warn "Could not grant objectAdmin on state bucket."
+  warn "This is expected in restricted sandboxes"
+  warn "In a real GCP project, run this script as an admin/owner."
+fi
 
 # ─── RESOLVE FULL PROVIDER RESOURCE NAME ──────────────────────────────────────
 WIF_PROVIDER="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/providers/${PROVIDER_ID}"
