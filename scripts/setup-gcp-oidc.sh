@@ -75,12 +75,11 @@ info "Creating Workload Identity Provider: $PROVIDER_ID ..."
 ATTRIBUTE_CONDITION="assertion.repository_owner == '${GITHUB_ORG}'"
 [[ -n "$GITHUB_REPO" ]] && ATTRIBUTE_CONDITION="assertion.repository == '${GITHUB_ORG}/${GITHUB_REPO}'"
 
-PROVIDER_EXISTS=$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
   --workload-identity-pool="$POOL_ID" \
   --location="global" \
-  --project="$PROJECT_ID" 2>/dev/null && echo "yes" || echo "no")
+  --project="$PROJECT_ID" &>/dev/null; then
 
-if [[ "$PROVIDER_EXISTS" == "yes" ]]; then
   warn "Provider '$PROVIDER_ID' already exists — updating attribute condition..."
   gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" \
     --project="$PROJECT_ID" \
