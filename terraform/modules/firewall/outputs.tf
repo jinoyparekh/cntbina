@@ -1,14 +1,19 @@
 output "rule_allow_internal" {
-  description = "Self-link of the allow-internal firewall rule"
-  value       = google_compute_firewall.allow_internal.self_link
+  description = "Name of the allow-internal firewall rule"
+  value       = google_compute_firewall.allow_internal.name
+}
+
+output "rule_allow_health_checks" {
+  description = "Name of the allow-health-checks firewall rule"
+  value       = google_compute_firewall.allow_health_checks.name
 }
 
 output "rule_allow_gke_master" {
-  description = "Self-link of the allow-gke-master firewall rule"
-  value       = google_compute_firewall.allow_gke_master.self_link
+  description = "Name of the allow-gke-master firewall rule"
+  value       = google_compute_firewall.allow_gke_master.name
 }
 
 output "rule_allow_asm" {
-  description = "Self-link of the allow-asm firewall rule"
-  value       = google_compute_firewall.allow_asm.self_link
+  description = "Name of the allow-asm firewall rule"
+  value       = google_compute_firewall.allow_asm.name
 }

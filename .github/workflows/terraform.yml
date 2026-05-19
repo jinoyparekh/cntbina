@@ -40,21 +40,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve changed modules
+      - name: Resolve modules to test
         id: changed
         run: |
           EVENT="${{ github.event_name }}"
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            MODULES=$(find terraform/tests -name '*_unit.tftest.hcl' \
+          scan_all() {
+            find terraform/tests -name '*_unit.tftest.hcl' \
               | xargs -I{} basename {} _unit.tftest.hcl \
-              | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))'
+          }
+
+          if [ "$EVENT" = "push" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            # push to main or manual trigger: always test ALL modules before apply
+            MODULES=$(scan_all)
           else
-            if [ "$EVENT" = "pull_request" ]; then
-              BASE="${{ github.event.pull_request.base.sha }}"
-            else
-              BASE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
-            fi
+            # PRs: only test changed modules for faster feedback
+            BASE="${{ github.event.pull_request.base.sha }}"
             CHANGED=$(git diff --name-only "$BASE" HEAD)
             FROM_MODULES=$(echo "$CHANGED" | grep -E '^terraform/modules/' | cut -d'/' -f3)
             FROM_TESTS=$(echo "$CHANGED" | grep -oP '(?<=terraform/tests/)[a-z0-9_]+(?=_)')
