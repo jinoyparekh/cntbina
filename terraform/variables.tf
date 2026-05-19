@@ -51,6 +51,11 @@ variable "master_cidr" {
   description = "GKE control plane CIDR. Must be /28 and must not overlap any subnet."
   type        = string
   default     = "10.3.0.0/28"
+
+  validation {
+    condition     = can(cidrhost(var.master_cidr, 0)) && split("/", var.master_cidr)[1] == "28"
+    error_message = "master_cidr must be a valid /28 CIDR block (GKE requirement)."
+  }
 }
 
 variable "flow_log_sampling" {

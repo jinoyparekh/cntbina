@@ -42,5 +42,18 @@ run "invalid_master_cidr_prefix_rejected" {
     master_cidr = "10.3.0.0/24"   # /24 is invalid — GKE requires /28
   }
 
-  expect_failures = [module.firewall]
+  # override_module prevents the firewall module's own /28 validation from firing
+  # as an unexpected second failure. The root var.master_cidr validation is the
+  # authoritative rejection point and the only one expect_failures can reference.
+  override_module {
+    target = module.firewall
+    outputs = {
+      rule_allow_internal      = "mock"
+      rule_allow_gke_master    = "mock"
+      rule_allow_asm           = "mock"
+      rule_allow_health_checks = "mock"
+    }
+  }
+
+  expect_failures = [var.master_cidr]
 }
