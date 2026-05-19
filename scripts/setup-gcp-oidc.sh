@@ -88,6 +88,7 @@ if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
     --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner" \
     --attribute-condition="$ATTRIBUTE_CONDITION" \
     --quiet
+  success "Provider updated."
 else
   gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
     --project="$PROJECT_ID" \
@@ -115,18 +116,20 @@ else
 fi
 
 # ─── IAM ROLES FOR TERRAFORM ──────────────────────────────────────────────────
+# Requires the caller to have roles/owner or roles/resourcemanager.projectIamAdmin.
 info "Granting IAM roles to service account..."
 TF_ROLES=(
-  roles/compute.networkAdmin          # VPC / subnets / firewall
-  roles/compute.securityAdmin         # firewall rules
-  roles/container.admin               # GKE clusters & node pools
-  roles/iam.roleAdmin                 # create/manage custom IAM roles
-  roles/iam.serviceAccountAdmin       # create/manage service accounts
-  roles/iam.serviceAccountUser        # attach SAs to resources
+  roles/compute.networkAdmin             # VPC / subnets / firewall
+  roles/compute.securityAdmin            # firewall rules
+  roles/container.admin                  # GKE clusters & node pools
+  roles/iam.roleAdmin                    # create/manage custom IAM roles
+  roles/iam.serviceAccountAdmin          # create/manage service accounts
+  roles/iam.serviceAccountUser           # attach SAs to resources
   roles/resourcemanager.projectIamAdmin  # bind roles at project level
-  roles/storage.admin                 # GCS bucket for TF state
+  roles/storage.admin                    # GCS bucket for TF state
   roles/serviceusage.serviceUsageAdmin   # enable APIs via TF
 )
+IAM_FAILED=()
 for ROLE in "${TF_ROLES[@]}"; do
   if gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_EMAIL}" \
@@ -135,10 +138,15 @@ for ROLE in "${TF_ROLES[@]}"; do
     --quiet; then
     info "  bound $ROLE"
   else
-    die "Failed to bind $ROLE to $SA_EMAIL — re-run as a project Owner, then retry."
+    warn "  failed to bind $ROLE — skipping (caller lacks resourcemanager.projectIamAdmin?)"
+    IAM_FAILED+=("$ROLE")
   fi
 done
-success "IAM roles granted."
+if [[ ${#IAM_FAILED[@]} -eq 0 ]]; then
+  success "All IAM roles granted."
+else
+  warn "${#IAM_FAILED[@]} role binding(s) failed — see manual steps in the summary below."
+fi
 
 # ─── ALLOW GITHUB ACTIONS TO IMPERSONATE THE SA ───────────────────────────────
 info "Binding Workload Identity Pool → Service Account..."
@@ -158,7 +166,7 @@ success "WIF → SA binding created."
 
 # ─── GCS TERRAFORM STATE BUCKET ───────────────────────────────────────────────
 info "Setting up Terraform state bucket: gs://${TF_BUCKET} ..."
-if gsutil ls -p "$PROJECT_ID" "gs://${TF_BUCKET}" &>/dev/null; then
+if gcloud storage ls --buckets "gs://${TF_BUCKET}" --project="$PROJECT_ID" &>/dev/null; then
   warn "Bucket 'gs://${TF_BUCKET}' already exists — skipping creation."
 else
   gcloud storage buckets create "gs://${TF_BUCKET}" \
@@ -167,23 +175,25 @@ else
     --uniform-bucket-level-access \
     --public-access-prevention \
     --quiet
-  # Enable versioning so TF state history is retained
   gcloud storage buckets update "gs://${TF_BUCKET}" \
     --versioning \
     --quiet
   success "Bucket created with versioning."
 fi
 
-# Grant SA objectAdmin on the state bucket (required for terraform init / plan / apply)
+# Grant the deployer SA objectAdmin on the state bucket.
+# Requires the caller to have roles/storage.admin on the bucket or project.
+BUCKET_IAM_OK=false
 if gcloud storage buckets add-iam-policy-binding "gs://${TF_BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
   --quiet; then
   success "SA granted objectAdmin on state bucket."
+  BUCKET_IAM_OK=true
 else
-  die "Failed to grant objectAdmin on gs://${TF_BUCKET} for ${SA_EMAIL}.
-  The Terraform pipeline WILL fail at init without this grant.
-  Re-run as a project Owner or Storage Admin, then retry."
+  warn "Could not grant objectAdmin on gs://${TF_BUCKET}."
+  warn "The Terraform pipeline WILL fail at init without this grant."
+  warn "Re-run as a project Owner / Storage Admin to apply it."
 fi
 
 # ─── RESOLVE FULL PROVIDER RESOURCE NAME ──────────────────────────────────────
@@ -192,14 +202,52 @@ WIF_PROVIDER="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/
 # ─── SUMMARY ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}  Setup complete. Add these as GitHub Actions secrets/vars:${NC}"
+echo -e "${GREEN}  Setup complete. Add these as GitHub Actions variables:    ${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  ${YELLOW}Secret name${NC}                         ${YELLOW}Value${NC}"
+echo -e "  ${YELLOW}Variable name${NC}                        ${YELLOW}Value${NC}"
 echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  GCP_PROJECT_ID                       ${CYAN}${PROJECT_ID}${NC}"
 echo -e "  GCP_WORKLOAD_IDENTITY_PROVIDER       ${CYAN}${WIF_PROVIDER}${NC}"
 echo -e "  GCP_SERVICE_ACCOUNT                  ${CYAN}${SA_EMAIL}${NC}"
 echo -e "  TF_STATE_BUCKET                      ${CYAN}${TF_BUCKET}${NC}"
 echo ""
 echo -e "  Terraform backend bucket: ${CYAN}gs://${TF_BUCKET}${NC}"
 echo ""
+
+# ─── MANUAL STEPS REQUIRED (if any grants failed) ─────────────────────────────
+NEEDS_MANUAL=false
+if [[ ${#IAM_FAILED[@]} -gt 0 ]]; then
+  NEEDS_MANUAL=true
+  echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
+  echo -e "${RED}  ACTION REQUIRED — IAM role bindings that failed:         ${NC}"
+  echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
+  echo ""
+  echo "  Run the following as a project Owner:"
+  echo ""
+  for ROLE in "${IAM_FAILED[@]}"; do
+    echo "  gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "    --member=\"serviceAccount:${SA_EMAIL}\" \\"
+    echo "    --role=\"${ROLE}\" --condition=None"
+    echo ""
+  done
+fi
+
+if [[ "$BUCKET_IAM_OK" == "false" ]]; then
+  NEEDS_MANUAL=true
+  echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
+  echo -e "${RED}  ACTION REQUIRED — state bucket IAM grant failed:         ${NC}"
+  echo -e "${RED}════════════════════════════════════════════════════════════${NC}"
+  echo ""
+  echo "  Run the following as a project Owner or Storage Admin:"
+  echo ""
+  echo "  gcloud storage buckets add-iam-policy-binding gs://${TF_BUCKET} \\"
+  echo "    --member=\"serviceAccount:${SA_EMAIL}\" \\"
+  echo "    --role=\"roles/storage.objectAdmin\""
+  echo ""
+fi
+
+if [[ "$NEEDS_MANUAL" == "false" ]]; then
+  echo -e "${GREEN}  All grants applied — no manual steps required.${NC}"
+  echo ""
+fi

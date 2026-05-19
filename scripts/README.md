@@ -13,14 +13,16 @@ Keyless auth between GitHub Actions and GCP via Workload Identity Federation. No
 | Service Account | `terraform-deployer@<project>.iam.gserviceaccount.com` |
 | GCS State Bucket | `<project-id>-tfstate` |
 
-SA roles: `compute.networkAdmin`, `compute.securityAdmin`, `container.admin`, `iam.roleAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `resourcemanager.projectIamAdmin`, `storage.admin`, `serviceusage.serviceUsageAdmin`
+SA roles granted at project level: `compute.networkAdmin`, `compute.securityAdmin`, `container.admin`, `iam.roleAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `resourcemanager.projectIamAdmin`, `storage.admin`, `serviceusage.serviceUsageAdmin`
+
+SA role granted on the state bucket: `storage.objectAdmin`
 
 ---
 
 ## Prerequisites
 
-- `gcloud` CLI authenticated (`gcloud auth login`)
-- Your account has Owner or `iam.workloadIdentityPoolAdmin` + `iam.serviceAccountAdmin` + `resourcemanager.projectIamAdmin`
+- `gcloud` CLI installed and authenticated (`gcloud auth login`)
+- Your account has **Owner** or all of: `iam.workloadIdentityPoolAdmin` + `iam.serviceAccountAdmin` + `resourcemanager.projectIamAdmin` + `storage.admin`
 
 ---
 
@@ -29,14 +31,16 @@ SA roles: `compute.networkAdmin`, `compute.securityAdmin`, `container.admin`, `i
 ```bash
 export PROJECT_ID="your-gcp-project-id"
 export GITHUB_ORG="your-github-org"
-# export GITHUB_REPO="infra-repo"   # optional: restrict to one repo instead of whole org
+# export GITHUB_REPO="infra-repo"   # optional: restrict WIF to one repo instead of whole org
 # export REGION="us-central1"       # default: us-central1
 
 chmod +x scripts/setup-gcp-oidc.sh
 ./scripts/setup-gcp-oidc.sh
 ```
 
-Idempotent — safe to re-run. At the end it prints the three values for Step 2.
+Idempotent — safe to re-run. At the end it prints the four values needed for Step 2.
+
+If any IAM binding fails (e.g. insufficient caller permissions), the script prints the exact `gcloud` commands to re-run as an Owner rather than exiting silently.
 
 ---
 
@@ -46,6 +50,7 @@ Go to **Settings → Secrets and variables → Actions → Variables** (not Secr
 
 | Variable name | Value (from script output) |
 |---|---|
+| `GCP_PROJECT_ID` | `your-gcp-project-id` |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/123.../providers/github-actions-provider` |
 | `GCP_SERVICE_ACCOUNT` | `terraform-deployer@your-project.iam.gserviceaccount.com` |
 | `TF_STATE_BUCKET` | `your-project-id-tfstate` |
@@ -54,45 +59,34 @@ Go to **Settings → Secrets and variables → Actions → Variables** (not Secr
 
 ---
 
-## Step 3 — Terraform backend
+## Step 3 — Push to master
 
-```hcl
-terraform {
-  backend "gcs" {
-    bucket = "your-project-id-tfstate"
-    prefix = "terraform/state"
-  }
-}
+The pipeline triggers automatically:
+
+```
+push → master
+  └─▶ module-tests.yml   (unit tests, no GCP creds)
+        └─▶ terraform.yml  (plan + apply, only if tests pass)
 ```
 
-Or let the workflow pass it dynamically via `-backend-config` (already done in `.github/workflows/terraform.yml`).
-
----
-
-## Step 4 — Push and trigger
-
-The workflow at `.github/workflows/terraform.yml` runs on every push/PR to `main`:
-
-- **PRs**: fmt check → validate → plan
-- **Push to main**: fmt check → validate → plan → apply
-
-Set `TF_DIR` in the workflow `env:` block if your `.tf` files are not in `terraform/`.
+No manual trigger needed. `terraform.yml` is blocked by `workflow_run` and will not run if any unit test fails.
 
 ---
 
 ## Verification
 
 ```bash
-# Pool and provider
+# Check pool and provider exist
 gcloud iam workload-identity-pools providers list \
   --workload-identity-pool=github-actions-pool \
   --location=global --project=$PROJECT_ID
 
-# State bucket
-gsutil ls -L gs://${PROJECT_ID}-tfstate
+# Check state bucket and its IAM
+gcloud storage ls --buckets "gs://${PROJECT_ID}-tfstate"
+gcloud storage buckets get-iam-policy "gs://${PROJECT_ID}-tfstate"
 ```
 
-A successful auth step in Actions shows:
+A successful auth step in GitHub Actions shows:
 ```
 Successfully created a credentials file for 'terraform-deployer@...'
 ```
@@ -103,8 +97,9 @@ Successfully created a credentials file for 'terraform-deployer@...'
 
 | Symptom | Fix |
 |---|---|
-| `workloadIdentityUser` denied | Re-run script; verify `GITHUB_ORG`/`GITHUB_REPO` match exactly |
-| Terraform state permission denied | SA needs `storage.admin` at project level — re-run script |
-| `id-token: write` missing | Already set in the workflow `permissions` block |
-| Provider attribute-condition fails | `GITHUB_ORG` must match the GitHub org slug exactly (case-sensitive) |
-| Sandbox bucket IAM warning | Expected — project-level `storage.admin` covers it |
+| `workloadIdentityUser` denied | Re-run script; verify `GITHUB_ORG`/`GITHUB_REPO` match exactly (case-sensitive) |
+| `storage.objects.list` denied at init | SA is missing `storage.objectAdmin` on the state bucket — run the bucket IAM command printed by the script |
+| `id-token: write` missing | Already set in the workflow `permissions` block — check you haven't overridden it |
+| Provider attribute-condition fails | `GITHUB_ORG` must match the GitHub org slug exactly |
+| IAM bindings silently skipped | Script now prints failed bindings explicitly — re-run as project Owner |
+| Sandbox: IAM commands fail | Expected — Pluralsight/ACG sandboxes block all IAM changes. Run the script in a real GCP project as Owner |

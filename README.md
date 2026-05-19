@@ -1,6 +1,6 @@
 # cntbina — GCP Infrastructure
 
-Infrastructure-as-code for deploying GCP resources (VPC, IAM, Subnets, GKE) via GitHub Actions with keyless authentication. No long-lived service account keys are stored anywhere.
+Infrastructure-as-code for deploying GCP resources (VPC, Subnets, Firewall, IAM) via GitHub Actions with keyless authentication. No long-lived service account keys are stored anywhere.
 
 ---
 
@@ -9,8 +9,8 @@ Infrastructure-as-code for deploying GCP resources (VPC, IAM, Subnets, GKE) via 
 | Problem | Solution |
 |---|---|
 | JSON keys in CI are a leak risk | Workload Identity Federation — GitHub's OIDC token exchanged for a short-lived GCP token per job |
-| Manual infra changes are untraceable | All changes go through Terraform, reviewed in PRs, applied only on merge to `main` |
-| Modules break silently | Native Terraform unit tests run on every PR, gated before plan/apply |
+| Manual infra changes are untraceable | All changes go through Terraform, reviewed in PRs, applied only on merge to `master` |
+| Modules break silently | Native Terraform unit tests run on every push to `master`, gated before plan/apply |
 | Credentials in state files | GCS backend with versioning, private bucket, SA-only access |
 
 ---
@@ -32,8 +32,7 @@ terraform-deployer SA
      └── Terraform Apply ──►  GCP Project
                                   ├── VPC + Subnets
                                   ├── Firewall rules
-                                  ├── Cloud NAT
-                                  ├── IAM bindings
+                                  ├── IAM / Service Accounts
                                   └── GKE cluster (upcoming)
 ```
 
@@ -45,8 +44,8 @@ terraform-deployer SA
 .
 ├── .github/
 │   └── workflows/
-│       ├── terraform.yml          # plan on PR, apply on merge to main
-│       └── module-tests.yml       # per-module unit tests on module/test changes
+│       ├── module-tests.yml       # entry point: unit tests on push to master
+│       └── terraform.yml          # plan + apply, triggered only after tests pass
 ├── scripts/
 │   ├── setup-gcp-oidc.sh          # one-time bootstrap: WIF + SA + GCS bucket
 │   └── README.md                  # step-by-step setup instructions
@@ -54,13 +53,14 @@ terraform-deployer SA
     ├── versions.tf                # backend + provider config
     ├── variables.tf               # root inputs
     ├── main.tf                    # module composition
-    ├── outputs.tf                 # root outputs
-    ├── terraform.tfvars.example   # copy → terraform.tfvars for local use
     ├── modules/
-    │   └── vpc/                   # VPC, subnets, firewall, NAT
+    │   ├── apis/                  # GCP API enablement
+    │   ├── vpc/                   # VPC network
+    │   ├── subnets/               # GKE subnets + secondary ranges
+    │   ├── firewall/              # firewall rules (internal, GKE master, ASM, health checks)
+    │   └── iam/                   # GKE node SA + security-tools Workload Identity SA
     └── tests/
-        ├── vpc_unit.tftest.hcl        # mock provider, no GCP needed
-        └── vpc_integration.tftest.hcl # real plan+apply against GCP
+        └── firewall_unit.tftest.hcl   # mock provider, no GCP creds needed
 ```
 
 ---
@@ -72,6 +72,7 @@ terraform-deployer SA
 ```bash
 export PROJECT_ID="your-gcp-project-id"
 export GITHUB_ORG="your-github-org"
+export GITHUB_REPO="your-repo-name"   # optional: restrict WIF to one repo
 ./scripts/setup-gcp-oidc.sh
 ```
 
@@ -84,30 +85,40 @@ export GITHUB_ORG="your-github-org"
 | `GCP_SERVICE_ACCOUNT` | printed by the script |
 | `TF_STATE_BUCKET` | printed by the script |
 
-**3. Copy and fill in tfvars for local work:**
-
-```bash
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-# edit terraform.tfvars with your values
-```
-
-**4. Push.** PRs get a plan; merges to `main` apply.
+**3. Push to `master`.** The pipeline runs automatically.
 
 ---
 
-## CI/CD pipelines
+## CI/CD pipeline
 
-### `module-tests.yml` — per-module unit tests
+Pushes to `master` trigger a two-workflow chain:
 
-Triggers only when `terraform/modules/**` or `terraform/tests/**` changes. Detects which modules changed and runs only those tests in parallel. Uses a mock GCP provider — no credentials required, runs on every PR in seconds.
+```
+push → master
+  └─▶ module-tests.yml        (all module unit tests, parallel, no GCP creds)
+        ├── detect-modules
+        ├── unit-test [module-a]
+        ├── unit-test [module-b]  ...
+        └── module-tests-complete
+              │
+              │ (only if all tests passed)
+              ▼
+          terraform.yml        (needs real GCP credentials)
+              ├── plan
+              └── apply
+```
+
+### `module-tests.yml` — unit tests
+
+Runs automatically on every push to `master`. Detects all test files under `terraform/tests/`, runs each module's `*_unit.tftest.hcl` in parallel using a mock GCP provider — no credentials required. Can also be triggered manually to run a single module ad-hoc.
 
 ### `terraform.yml` — plan & apply
 
-Triggers on all PRs and pushes to `main`. Unit tests must pass before this job runs. Applies only on merge to `main`.
+Triggered automatically by `workflow_run` only after `module-tests.yml` completes successfully. Never runs if any unit test fails. Can also be triggered manually via `workflow_dispatch` (plan or apply).
 
 ```
-PR:    unit-tests → fmt check → validate → plan
-main:  unit-tests → fmt check → validate → plan → apply
+Push to master:   [tests pass] → plan → apply
+Manual dispatch:  plan  (or apply if action=apply)
 ```
 
 ---
@@ -116,7 +127,11 @@ main:  unit-tests → fmt check → validate → plan → apply
 
 | Module | Path | What it creates |
 |---|---|---|
-| `vpc` | `modules/vpc` | VPC network, regional subnet with GKE secondary ranges, internal firewall, health-check firewall, Cloud Router, Cloud NAT |
+| `apis` | `modules/apis` | Enables required GCP APIs |
+| `vpc` | `modules/vpc` | VPC network |
+| `subnets` | `modules/subnets` | GKE node/pod/service subnets with secondary ranges |
+| `firewall` | `modules/firewall` | Firewall rules: internal, GKE master, ASM/Istio, health checks |
+| `iam` | `modules/iam` | GKE node SA (least-privilege) + security-tools Workload Identity SA |
 
 ---
 
@@ -128,8 +143,8 @@ cd terraform/
 # init without backend (local state)
 terraform init -backend=false
 
-# run unit tests (no GCP creds needed)
-terraform test -filter=tests/vpc_unit.tftest.hcl
+# run all unit tests (no GCP creds needed)
+terraform test -filter=tests/firewall_unit.tftest.hcl
 
 # plan against real GCP
 terraform init -backend-config="bucket=<TF_STATE_BUCKET>"
