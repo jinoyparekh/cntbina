@@ -1,6 +1,16 @@
-project_id        = "your-gcp-project-id"
-region            = "us-central1"
-environment       = "dev"
-vpc_subnet_cidr   = "10.10.0.0/20"
-vpc_pods_cidr     = "10.20.0.0/16"
-vpc_services_cidr = "10.30.0.0/20"
+project_id  = "your-gcp-project-id"
+region      = "us-central1"
+environment = "lab"
+
+# CIDRs — all within 10.0.0.0/20, right-sized for a ~10-node security test lab
+nodes_cidr    = "10.0.0.0/24"
+pods_cidr     = "10.1.0.0/21"
+services_cidr = "10.2.0.0/24"
+master_cidr   = "10.3.0.0/28"
+
+flow_log_sampling = 0.5
+
+k8s_namespace = "security-tools"
+
+# Optional: add APIs beyond the required set
+# extra_apis = ["secretmanager.googleapis.com"]

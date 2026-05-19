@@ -5,46 +5,15 @@ resource "google_compute_network" "this" {
   routing_mode            = "REGIONAL"
 }
 
-resource "google_compute_subnetwork" "this" {
-  project                  = var.project_id
-  name                     = "${var.name}-subnet-${var.region}"
-  network                  = google_compute_network.this.id
-  region                   = var.region
-  ip_cidr_range            = var.subnet_cidr
-  private_ip_google_access = true
+# DNS query logging — critical for threat detection in a security lab
+resource "google_dns_policy" "logging" {
+  project        = var.project_id
+  name           = "${var.name}-dns-logging"
+  enable_logging = true
 
-  secondary_ip_range {
-    range_name    = "pods"
-    ip_cidr_range = var.pods_cidr
+  networks {
+    network_url = google_compute_network.this.id
   }
-
-  secondary_ip_range {
-    range_name    = "services"
-    ip_cidr_range = var.services_cidr
-  }
-}
-
-resource "google_compute_firewall" "allow_internal" {
-  project = var.project_id
-  name    = "${var.name}-allow-internal"
-  network = google_compute_network.this.id
-
-  allow { protocol = "tcp" }
-  allow { protocol = "udp" }
-  allow { protocol = "icmp" }
-
-  source_ranges = [var.subnet_cidr, var.pods_cidr, var.services_cidr]
-}
-
-resource "google_compute_firewall" "allow_health_checks" {
-  project = var.project_id
-  name    = "${var.name}-allow-health-checks"
-  network = google_compute_network.this.id
-
-  allow { protocol = "tcp" }
-
-  # GCP health check probe source ranges
-  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
 }
 
 resource "google_compute_router" "this" {
@@ -54,6 +23,7 @@ resource "google_compute_router" "this" {
   region  = var.region
 }
 
+# NAT so private nodes can reach internet (image pulls, vendor agents) without public IPs
 resource "google_compute_router_nat" "this" {
   project                            = var.project_id
   name                               = "${var.name}-nat"
@@ -64,6 +34,6 @@ resource "google_compute_router_nat" "this" {
 
   log_config {
     enable = true
-    filter = var.nat_log_filter
+    filter = "ERRORS_ONLY"
   }
 }

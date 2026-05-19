@@ -1,17 +1,8 @@
 name: Module Tests
 
+# Manual-only. Automatic module testing is handled by terraform.yml (stages 1-3).
+# Use this to run tests ad-hoc without triggering a full plan/apply.
 on:
-  pull_request:
-    paths:
-      - "terraform/modules/**"
-      - "terraform/tests/**"
-      - "terraform/versions.tf"
-      - ".github/workflows/module-tests.yml"
-  push:
-    branches: [main]
-    paths:
-      - "terraform/modules/**"
-      - "terraform/tests/**"
   workflow_dispatch:
     inputs:
       module:
@@ -44,33 +35,14 @@ jobs:
       - name: Resolve changed modules
         id: changed
         run: |
-          EVENT="${{ github.event_name }}"
           MANUAL_MODULE="${{ inputs.module }}"
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            if [ -n "$MANUAL_MODULE" ]; then
-              # Single module specified manually
-              MODULES=$(echo "$MANUAL_MODULE" | jq -R -c '[.]')
-            else
-              # No input → test every module that has a unit test file
-              MODULES=$(find terraform/tests -name '*_unit.tftest.hcl' \
-                | xargs -I{} basename {} _unit.tftest.hcl \
-                | sort -u \
-                | jq -R -s -c 'split("\n") | map(select(length > 0))')
-            fi
+          if [ -n "$MANUAL_MODULE" ]; then
+            MODULES=$(echo "$MANUAL_MODULE" | jq -R -c '[.]')
           else
-            if [ "$EVENT" = "pull_request" ]; then
-              BASE="${{ github.event.pull_request.base.sha }}"
-            else
-              BASE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
-            fi
-
-            CHANGED=$(git diff --name-only "$BASE" HEAD)
-            FROM_MODULES=$(echo "$CHANGED" | grep -E '^terraform/modules/' | cut -d'/' -f3)
-            FROM_TESTS=$(echo "$CHANGED" | grep -oP '(?<=terraform/tests/)[a-z0-9_]+(?=_)')
-
-            MODULES=$(printf '%s\n%s' "$FROM_MODULES" "$FROM_TESTS" \
-              | grep -v '^$' | sort -u \
+            MODULES=$(find terraform/tests -name '*_unit.tftest.hcl' \
+              | xargs -I{} basename {} _unit.tftest.hcl \
+              | sort -u \
               | jq -R -s -c 'split("\n") | map(select(length > 0))')
           fi
 

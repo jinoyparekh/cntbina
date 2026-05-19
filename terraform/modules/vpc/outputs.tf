@@ -9,26 +9,6 @@ output "network_name" {
 }
 
 output "network_self_link" {
-  description = "VPC network self-link (used by GKE, GCE, etc.)"
+  description = "VPC network self-link (used by GKE, subnetworks, firewall)"
   value       = google_compute_network.this.self_link
-}
-
-output "subnet_name" {
-  description = "Primary subnet name"
-  value       = google_compute_subnetwork.this.name
-}
-
-output "subnet_self_link" {
-  description = "Primary subnet self-link"
-  value       = google_compute_subnetwork.this.self_link
-}
-
-output "pods_range_name" {
-  description = "Secondary range name for GKE pods"
-  value       = "pods"
-}
-
-output "services_range_name" {
-  description = "Secondary range name for GKE services"
-  value       = "services"
 }
