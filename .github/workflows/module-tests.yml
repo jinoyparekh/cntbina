@@ -1,8 +1,10 @@
 name: Module Tests
 
-# Manual-only. Automatic module testing is handled by terraform.yml (stages 1-3).
-# Use this to run tests ad-hoc without triggering a full plan/apply.
+# Runs automatically on push to master and chains into terraform.yml on success.
+# Can also be triggered manually to run tests ad-hoc without a full plan/apply.
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       module:

@@ -1,10 +1,13 @@
 name: Terraform
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Auto-triggered only after Module Tests workflow completes successfully on master.
+  # This enforces the order: all module tests pass → plan → apply.
+  workflow_run:
+    workflows: ["Module Tests"]
+    types: [completed]
+    branches: [master]
+  # Manual escape hatch: run plan or apply without the test gate (e.g. re-apply, emergency).
   workflow_dispatch:
     inputs:
       action:
@@ -24,123 +27,21 @@ env:
   TF_IN_AUTOMATION: "1"
   TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
 
-# ── STAGE 1: detect which modules changed ─────────────────────────────────────
+# ── STAGE 1: plan ────────────────────────────────────────────────────────────────
+# Skipped entirely when Module Tests did not succeed (no need for a separate gate job).
 jobs:
-  detect-modules:
-    name: Detect modules
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      modules:     ${{ steps.changed.outputs.modules }}
-      any_changed: ${{ steps.changed.outputs.any_changed }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Resolve modules to test
-        id: changed
-        run: |
-          EVENT="${{ github.event_name }}"
-
-          scan_all() {
-            find terraform/tests -name '*_unit.tftest.hcl' \
-              | xargs -I{} basename {} _unit.tftest.hcl \
-              | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))'
-          }
-
-          if [ "$EVENT" = "push" ] || [ "$EVENT" = "workflow_dispatch" ]; then
-            # push to main or manual trigger: always test ALL modules before apply
-            MODULES=$(scan_all)
-          else
-            # PRs: only test changed modules for faster feedback
-            BASE="${{ github.event.pull_request.base.sha }}"
-            CHANGED=$(git diff --name-only "$BASE" HEAD)
-            FROM_MODULES=$(echo "$CHANGED" | grep -E '^terraform/modules/' | cut -d'/' -f3)
-            FROM_TESTS=$(echo "$CHANGED" | grep -oP '(?<=terraform/tests/)[a-z0-9_]+(?=_)')
-            MODULES=$(printf '%s\n%s' "$FROM_MODULES" "$FROM_TESTS" \
-              | grep -v '^$' | sort -u \
-              | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          fi
-
-          if [ "$MODULES" = "[]" ] || [ -z "$MODULES" ]; then
-            echo "any_changed=false" >> "$GITHUB_OUTPUT"
-            echo "modules=[]"        >> "$GITHUB_OUTPUT"
-          else
-            echo "any_changed=true"  >> "$GITHUB_OUTPUT"
-            echo "modules=$MODULES"  >> "$GITHUB_OUTPUT"
-          fi
-
-# ── STAGE 2: unit tests per module (parallel, no GCP creds) ───────────────────
-  unit-tests:
-    name: "Test: ${{ matrix.module }}"
-    runs-on: ubuntu-latest
-    needs: detect-modules
-    if: needs.detect-modules.outputs.any_changed == 'true'
-    permissions:
-      contents: read   # no id-token — mock provider, zero GCP calls
-
-    strategy:
-      fail-fast: false
-      matrix:
-        module: ${{ fromJson(needs.detect-modules.outputs.modules) }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Create plugin cache dir
-        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-
-      - name: Cache providers
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-${{ runner.os }}-${{ hashFiles('terraform/versions.tf') }}
-          restore-keys: tf-${{ runner.os }}-
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.9"
-
-      - run: terraform init -backend=false
-        working-directory: ${{ env.TF_DIR }}
-
-      - name: Run tests
-        run: terraform test -filter=tests/${{ matrix.module }}_unit.tftest.hcl -verbose
-        working-directory: ${{ env.TF_DIR }}
-
-# ── STAGE 3: gate — blocks plan/apply if any unit test failed ─────────────────
-  tests-gate:
-    name: Tests gate
-    runs-on: ubuntu-latest
-    needs: [detect-modules, unit-tests]
-    if: always()
-    permissions:
-      contents: read
-
-    steps:
-      - name: Evaluate
-        run: |
-          CHANGED="${{ needs.detect-modules.outputs.any_changed }}"
-          RESULT="${{ needs.unit-tests.result }}"
-          if [ "$CHANGED" = "false" ]; then
-            echo "No module changes — gate passes."; exit 0
-          fi
-          if [ "$RESULT" = "success" ]; then
-            echo "All unit tests passed — gate passes."; exit 0
-          fi
-          echo "Unit tests ${RESULT} — blocking terraform pipeline."; exit 1
-
-# ── STAGE 4: plan (always runs on push/PR/dispatch, never applies) ────────────
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
-    needs: tests-gate
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'workflow_dispatch'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # For workflow_run events use the SHA that triggered the tests, not the default branch HEAD.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -185,17 +86,21 @@ jobs:
           path: ${{ env.TF_DIR }}tfplan
           retention-days: 1
 
-# ── STAGE 5: apply (main push OR manual apply — uses exact plan from stage 4) ─
+# ── STAGE 2: apply ───────────────────────────────────────────────────────────────
+# Runs automatically after a successful push-triggered plan (workflow_run path).
+# On manual dispatch, only runs when action == apply.
   apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
     needs: plan
     if: |
-      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_run' ||
       (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
