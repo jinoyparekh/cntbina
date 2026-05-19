@@ -12,6 +12,12 @@ on:
     paths:
       - "terraform/modules/**"
       - "terraform/tests/**"
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Module to test (leave blank to test all)"
+        required: false
+        default: ""
 
 # Minimum permissions — no GCP auth needed for mock-provider unit tests
 permissions:
@@ -38,22 +44,35 @@ jobs:
       - name: Resolve changed modules
         id: changed
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
+          EVENT="${{ github.event_name }}"
+          MANUAL_MODULE="${{ inputs.module }}"
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ -n "$MANUAL_MODULE" ]; then
+              # Single module specified manually
+              MODULES=$(echo "$MANUAL_MODULE" | jq -R -c '[.]')
+            else
+              # No input → test every module that has a unit test file
+              MODULES=$(find terraform/tests -name '*_unit.tftest.hcl' \
+                | xargs -I{} basename {} _unit.tftest.hcl \
+                | sort -u \
+                | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            fi
           else
-            BASE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
+            if [ "$EVENT" = "pull_request" ]; then
+              BASE="${{ github.event.pull_request.base.sha }}"
+            else
+              BASE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
+            fi
+
+            CHANGED=$(git diff --name-only "$BASE" HEAD)
+            FROM_MODULES=$(echo "$CHANGED" | grep -E '^terraform/modules/' | cut -d'/' -f3)
+            FROM_TESTS=$(echo "$CHANGED" | grep -oP '(?<=terraform/tests/)[a-z0-9_]+(?=_)')
+
+            MODULES=$(printf '%s\n%s' "$FROM_MODULES" "$FROM_TESTS" \
+              | grep -v '^$' | sort -u \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
           fi
-
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
-
-          # terraform/modules/<module>/... → <module>
-          FROM_MODULES=$(echo "$CHANGED" | grep -E '^terraform/modules/' | cut -d'/' -f3)
-          # terraform/tests/<module>_*.tftest.hcl → <module>
-          FROM_TESTS=$(echo "$CHANGED" | grep -oP '(?<=terraform/tests/)[a-z0-9_]+(?=_)')
-
-          MODULES=$(printf '%s\n%s' "$FROM_MODULES" "$FROM_TESTS" \
-            | grep -v '^$' | sort -u \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
           if [ "$MODULES" = "[]" ] || [ -z "$MODULES" ]; then
             echo "any_changed=false" >> "$GITHUB_OUTPUT"
