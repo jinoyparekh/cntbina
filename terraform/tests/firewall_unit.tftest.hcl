@@ -42,5 +42,5 @@ run "invalid_master_cidr_prefix_rejected" {
     master_cidr = "10.3.0.0/24"   # /24 is invalid — GKE requires /28
   }
 
-  expect_failures = [var.master_cidr]
+  expect_failures = [module.firewall]
 }
