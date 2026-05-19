@@ -128,12 +128,15 @@ TF_ROLES=(
   roles/serviceusage.serviceUsageAdmin   # enable APIs via TF
 )
 for ROLE in "${TF_ROLES[@]}"; do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  if gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="$ROLE" \
     --condition=None \
-    --quiet 2>/dev/null | grep -q "bindings" && true
-  info "  bound $ROLE"
+    --quiet; then
+    info "  bound $ROLE"
+  else
+    die "Failed to bind $ROLE to $SA_EMAIL — re-run as a project Owner, then retry."
+  fi
 done
 success "IAM roles granted."
 
@@ -171,16 +174,16 @@ else
   success "Bucket created with versioning."
 fi
 
-# Grant SA access to the state bucket
+# Grant SA objectAdmin on the state bucket (required for terraform init / plan / apply)
 if gcloud storage buckets add-iam-policy-binding "gs://${TF_BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
   --quiet; then
   success "SA granted objectAdmin on state bucket."
 else
-  warn "Could not grant objectAdmin on state bucket."
-  warn "This is expected in restricted sandboxes"
-  warn "In a real GCP project, run this script as an admin/owner."
+  die "Failed to grant objectAdmin on gs://${TF_BUCKET} for ${SA_EMAIL}.
+  The Terraform pipeline WILL fail at init without this grant.
+  Re-run as a project Owner or Storage Admin, then retry."
 fi
 
 # ─── RESOLVE FULL PROVIDER RESOURCE NAME ──────────────────────────────────────
